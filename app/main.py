@@ -1,21 +1,18 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from sync import Sync
 from sync.common import Audio, Video, GenerationOptions
 from sync.core.api_error import ApiError
-import os
-import uuid
-import time
+import os, uuid, time, requests, cloudinary, cloudinary.uploader
 from tqdm import tqdm
 from dotenv import load_dotenv
-import requests
 
-# Load environment variables
+# ------------------- Load Environment -------------------
 load_dotenv()
 
 app = FastAPI(title="Sync.so Lip-Sync API")
 
-# Get API key from .env
+# Sync API Key
 API_KEY = os.getenv("SYNC_API_KEY")
 if not API_KEY:
     raise RuntimeError("Missing SYNC_API_KEY in environment variables")
@@ -23,58 +20,48 @@ if not API_KEY:
 # Initialize Sync client
 client = Sync(base_url="https://api.sync.so", api_key=API_KEY).generations
 
+# Cloudinary Setup
+CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
+if not CLOUDINARY_URL:
+    raise RuntimeError("Missing CLOUDINARY_URL in environment variables")
+
+cloudinary.config(cloudinary_url=CLOUDINARY_URL)
+
+# Local folder (for temp save)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Predefined videos
 PREDEFINED_VIDEOS = {
-    # The FILE_ID is '1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI'
-    "video1": "https://drive.google.com/uc?export=download&id=1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI",
-    "video2": "https://drive.google.com/uc?export=download&id=YOUR_VIDEO2_ID"
+    "video1": "https://drive.google.com/uc?export=download&id=1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI"
 }
 
-# ---------------------- Helper functions ----------------------
-
-def save_upload(file: UploadFile) -> str:
-    """Save uploaded file locally and return path."""
-    filename = f"{uuid.uuid4().hex}_{file.filename}"
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    with open(path, "wb") as f:
-        f.write(file.file.read())
-    return path
-
-@app.get("/uploads/{filename}")
-async def serve_uploaded_file(filename: str):
-    """Serve uploaded files via URL (used by Sync.so)."""
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path, media_type="audio/wav")
-
-# ---------------------- Main Endpoint ----------------------
-
+# ------------------- Main Endpoint -------------------
 @app.post("/generate-lipsync/")
 async def generate_lipsync(
-    request: Request,
     audio: UploadFile = File(...),
-    video_choice: str = Query("video1", description="Choose predefined video: video1 or video2")
+    video_choice: str = Query("video1", description="Choose predefined video")
 ):
     if video_choice not in PREDEFINED_VIDEOS:
         raise HTTPException(status_code=400, detail="Invalid video choice")
 
     video_url = PREDEFINED_VIDEOS[video_choice]
+    audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{audio.filename}")
 
     try:
-        # Save uploaded audio locally
-        audio_path = save_upload(audio)
-        filename = os.path.basename(audio_path)
+        # Save audio locally
+        with open(audio_path, "wb") as f:
+            f.write(await audio.read())
 
-        # Build accessible URL for Sync.so
-        base_url = str(request.base_url).rstrip("/")
-        audio_url = f"{base_url}/uploads/{filename}"
+        # Upload audio to Cloudinary (get public URL)
+        upload_result = cloudinary.uploader.upload(audio_path, resource_type="video")
+        public_audio_url = upload_result["secure_url"]
+
+        print(f"🎵 Uploaded audio to Cloudinary: {public_audio_url}")
 
         # Start Sync.so generation
         response = client.create(
-            input=[Video(url=video_url), Audio(url=audio_url)],
+            input=[Video(url=video_url), Audio(url=public_audio_url)],
             model="lipsync-2",
             options=GenerationOptions(sync_mode="cut_off")
         )
@@ -83,7 +70,6 @@ async def generate_lipsync(
         status = "PENDING"
         progress_bar = tqdm(total=100, desc="Processing", position=0)
 
-        # Poll until complete
         while status not in ["COMPLETED", "FAILED"]:
             time.sleep(5)
             generation = client.get(job_id)
@@ -94,7 +80,6 @@ async def generate_lipsync(
         progress_bar.close()
 
         if status == "COMPLETED":
-            # Download generated video
             output_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_lipsync.mp4")
             r = requests.get(generation.output_url, stream=True)
             with open(output_file, "wb") as f:
