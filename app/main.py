@@ -1,17 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import JSONResponse # <-- Changed to return JSON
+from fastapi.responses import JSONResponse
 from sync import Sync
 from sync.common import Audio, Video, GenerationOptions
 from sync.core.api_error import ApiError
 import os, uuid, time, requests, cloudinary, cloudinary.uploader
 from tqdm import tqdm
 from dotenv import load_dotenv
-from starlette.status import HTTP_202_ACCEPTED # ✅ IMPORT ADDED
+from starlette.status import HTTP_202_ACCEPTED # Not used in this version, but kept for context
 from fastapi.middleware.cors import CORSMiddleware
+
 # ------------------- Load Environment -------------------
 load_dotenv()
 
 app = FastAPI(title="Sync.so Lip-Sync API")
+
 # --- CORS Middleware (ALLOWS FRONTEND TO CONNECT) ---
 app.add_middleware(
     CORSMiddleware,
@@ -20,6 +22,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # Sync API Key
 API_KEY = os.getenv("SYNC_API_KEY")
 if not API_KEY:
@@ -44,23 +47,30 @@ PREDEFINED_VIDEOS = {
     "video1": "https://drive.google.com/uc?export=download&id=1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI"
 }
 
-# ... (rest of the imports and setup remain the same) ...
-
 # ------------------- Main Endpoint -------------------
 @app.post("/generate-lipsync/")
 async def generate_lipsync(
     audio: UploadFile = File(...),
     video_choice: str = Query("video1", description="Choose predefined video")
 ):
-    # ... (initial checks and file saving logic remain the same) ...
-    # audio_path and public_audio_url are set up here
+    if video_choice not in PREDEFINED_VIDEOS:
+        raise HTTPException(status_code=400, detail="Invalid video choice")
+
+    video_url = PREDEFINED_VIDEOS[video_choice]
+    audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{audio.filename}")
+    
+    # Initialize variables for cleanup
+    audio_file_saved = False 
 
     try:
         # Save audio locally
-        # ... (audio saving logic) ...
+        with open(audio_path, "wb") as f:
+            f.write(await audio.read())
+        audio_file_saved = True # Mark that the file exists for cleanup
 
         # Upload audio to Cloudinary (get public URL)
-        # ... (Cloudinary upload logic) ...
+        upload_result = cloudinary.uploader.upload(audio_path, resource_type="video")
+        public_audio_url = upload_result["secure_url"]
 
         print(f"🎵 Uploaded audio to Cloudinary: {public_audio_url}")
 
@@ -76,20 +86,18 @@ async def generate_lipsync(
         progress_bar = tqdm(total=100, desc="Processing", position=0)
         progress_increment = 5  # Simple time-based increment
 
+        # Polling Loop (Synchronous)
         while status not in ["COMPLETED", "FAILED", "REJECTED"]:
             time.sleep(5)
             generation = client.get(job_id)
             status = generation.status
             
-            # ------------------- ERROR FIX: Remove generation.progress -------------------
-            # Since 'progress' is not a reliable attribute, we use a simple increment
-            # to make the progress bar move while we wait for the status.
-            
-            # This logic provides *simulated* progress without crashing:
+            # ------------------- FIX FOR AttributeError: 'Generation' object has no attribute 'progress' -------------------
             if status == "PROCESSING" and progress_bar.n < 90:
                 progress_bar.update(progress_increment)
-            elif status == "COMPLETED" or status == "FAILED":
-                progress_bar.n = 100
+            elif status in ["COMPLETED", "FAILED", "REJECTED"]:
+                # Ensure the bar is complete when the job is done
+                progress_bar.n = 100 
                 
             progress_bar.set_postfix_str(f"Status: {status}")
 
@@ -103,23 +111,20 @@ async def generate_lipsync(
                 }
             )
         else:
-            # Handle FAILED or REJECTED status and include error message if available
+            # Handle FAILED or REJECTED status
             error_detail = generation.error_message if generation.error_message else "Generation failed without a specific message."
             raise HTTPException(status_code=500, detail=f"Generation failed. Status: {status}. Detail: {error_detail}")
 
     except ApiError as e:
+        # Sync.so API errors (e.g., 400 Bad Request)
         raise HTTPException(status_code=e.status_code, detail=e.body)
     
     except Exception as e:
-        # The generic Exception handler will catch the original AttributeError 
-        # (if it somehow occurred outside the fixed loop) and handle it gracefully.
+        # General unexpected errors (e.g., network, file system, or a misattributed variable)
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {e}")
 
     finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-    finally:
-        # Clean up the locally saved audio file
-        if os.path.exists(audio_path):
+        # Clean up the locally saved audio file only if it was actually saved
+        if audio_file_saved and os.path.exists(audio_path):
             os.remove(audio_path)
