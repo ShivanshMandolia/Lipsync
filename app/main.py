@@ -57,8 +57,6 @@ async def generate_lipsync(
         upload_result = cloudinary.uploader.upload(audio_path, resource_type="video")
         public_audio_url = upload_result["secure_url"]
 
-        print(f"🎵 Uploaded audio to Cloudinary: {public_audio_url}")
-
         # Start Sync.so generation
         response = client.create(
             input=[Video(url=video_url), Audio(url=public_audio_url)],
@@ -68,35 +66,32 @@ async def generate_lipsync(
 
         job_id = response.id
         status = "PENDING"
-        progress_bar = tqdm(total=100, desc="Processing", position=0)
-
         while status not in ["COMPLETED", "FAILED"]:
             time.sleep(5)
             generation = client.get(job_id)
             status = generation.status
-            progress_bar.update(5)
-            progress_bar.set_postfix_str(f"Status: {status}")
-
-        progress_bar.close()
 
         if status == "COMPLETED":
+            # Download generated video temporarily
             output_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_lipsync.mp4")
             r = requests.get(generation.output_url, stream=True)
             with open(output_file, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-            return FileResponse(
-                path=output_file,
-                filename="lipsync_video.mp4",
-                media_type="video/mp4"
-            )
+            # Upload generated video to Cloudinary to get public URL
+            video_upload = cloudinary.uploader.upload(output_file, resource_type="video")
+            public_video_url = video_upload["secure_url"]
+
+            # Clean up local files
+            os.remove(audio_path)
+            os.remove(output_file)
+
+            return {"video_url": public_video_url}  # FRONTEND USES THIS
+
         else:
             raise HTTPException(status_code=500, detail="Generation failed")
 
     except ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.body)
 
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
