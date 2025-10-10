@@ -1,97 +1,108 @@
+import os
+import uuid
+import time
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware # ✅ IMPORT ADDED
+import cloudinary
+import cloudinary.uploader
+from dotenv import load_dotenv
 from sync import Sync
 from sync.common import Audio, Video, GenerationOptions
 from sync.core.api_error import ApiError
-import os, uuid, time, requests, cloudinary, cloudinary.uploader
-from tqdm import tqdm
-from dotenv import load_dotenv
 
-# ------------------- Load Environment -------------------
+# ------------------- Load Environment & Configuration -------------------
 load_dotenv()
+app = FastAPI(title="Lip-Sync Generation API")
 
-app = FastAPI(title="Sync.so Lip-Sync API")
-
-# Sync API Key
-API_KEY = os.getenv("SYNC_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Missing SYNC_API_KEY in environment variables")
-
-# Initialize Sync client
-client = Sync(base_url="https://api.sync.so", api_key=API_KEY).generations
-
-# Cloudinary Setup
+# --- Environment Variables ---
+SYNC_API_KEY = os.getenv("SYNC_API_KEY")
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
-if not CLOUDINARY_URL:
-    raise RuntimeError("Missing CLOUDINARY_URL in environment variables")
+if not SYNC_API_KEY or not CLOUDINARY_URL:
+    raise RuntimeError("Missing SYNC_API_KEY or CLOUDINARY_URL in environment variables")
 
+# --- CORS Middleware (ALLOWS FRONTEND TO CONNECT) ---
+# This is crucial for your React/JavaScript frontend to be able to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# --- Initialize API Clients & Constants ---
+client = Sync(base_url="https://api.sync.so", api_key=SYNC_API_KEY).generations
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
-
-# Local folder (for temp save)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Predefined videos
 PREDEFINED_VIDEOS = {
-    "video1": "https://drive.google.com/uc?export=download&id=1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI"
+    "video1": "https://res.cloudinary.com/dazwg6em3/video/upload/v1727710328/morgan_freeman_hbhs1g.mp4" # A reliable, directly hosted video
 }
 
-# ------------------- Main Endpoint -------------------
+# ------------------- Main API Endpoint -------------------
 @app.post("/generate-lipsync/")
 async def generate_lipsync(
     audio: UploadFile = File(...),
-    video_choice: str = Query("video1", description="Choose predefined video")
+    video_choice: str = Query("video1", description="Choose a predefined video")
 ):
     if video_choice not in PREDEFINED_VIDEOS:
-        raise HTTPException(status_code=400, detail="Invalid video choice")
+        raise HTTPException(status_code=400, detail="Invalid video choice.")
 
-    video_url = PREDEFINED_VIDEOS[video_choice]
-    audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{audio.filename}")
+    # Use a secure, unique filename for the temporary audio file
+    temp_audio_filename = f"{uuid.uuid4().hex}.wav"
+    audio_path = os.path.join(UPLOAD_FOLDER, temp_audio_filename)
 
     try:
-        # Save audio locally
+        # 1. Save the uploaded audio file temporarily
         with open(audio_path, "wb") as f:
-            f.write(await audio.read())
+            content = await audio.read()
+            f.write(content)
 
-        # Upload audio to Cloudinary (get public URL)
+        # 2. Upload the audio to Cloudinary to get a public URL
+        # The resource_type 'video' works for audio files as well on Cloudinary
         upload_result = cloudinary.uploader.upload(audio_path, resource_type="video")
         public_audio_url = upload_result["secure_url"]
 
-        # Start Sync.so generation
+        # 3. 🚀 Start the lip-sync generation job with Sync.so
+        video_url = PREDEFINED_VIDEOS[video_choice]
         response = client.create(
             input=[Video(url=video_url), Audio(url=public_audio_url)],
             model="lipsync-2",
             options=GenerationOptions(sync_mode="cut_off")
         )
-
         job_id = response.id
-        status = "PENDING"
-        while status not in ["COMPLETED", "FAILED"]:
-            time.sleep(5)
+
+        # 4. Poll for the result (with a timeout to prevent server hanging)
+        start_time = time.time()
+        while time.time() - start_time < 300: # 5-minute timeout
             generation = client.get(job_id)
-            status = generation.status
-
-        if status == "COMPLETED":
-            # Download generated video temporarily
-            output_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_lipsync.mp4")
-            r = requests.get(generation.output_url, stream=True)
-            with open(output_file, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            # Upload generated video to Cloudinary to get public URL
-            video_upload = cloudinary.uploader.upload(output_file, resource_type="video")
-            public_video_url = video_upload["secure_url"]
-
-            # Clean up local files
-            os.remove(audio_path)
-            os.remove(output_file)
-
-            return {"video_url": public_video_url}  # FRONTEND USES THIS
-
+            if generation.status == "COMPLETED":
+                break
+            if generation.status == "FAILED":
+                # Provide a more detailed error if the job fails
+                error_detail = generation.error or "Lip-sync generation failed at the provider."
+                raise HTTPException(status_code=500, detail=error_detail)
+            time.sleep(5) # Wait 5 seconds before checking again
         else:
-            raise HTTPException(status_code=500, detail="Generation failed")
+            raise HTTPException(status_code=504, detail="Generation timed out after 5 minutes.")
+
+        # 5. ✅ IMPROVEMENT: Upload the final video directly from its URL to Cloudinary
+        # This avoids saving the file to our server, making it faster and more efficient.
+        final_video_url = generation.output_url
+        video_upload = cloudinary.uploader.upload(final_video_url, resource_type="video")
+        
+        return {"video_url": video_upload["secure_url"]}
 
     except ApiError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.body)
-
+        raise HTTPException(status_code=e.status_code, detail=str(e.body))
+    except HTTPException as e:
+        # Re-raise HTTP exceptions to send proper responses to the client
+        raise e
+    except Exception as e:
+        # Catch any other unexpected errors
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+    finally:
+        # 6. Clean up the temporary local audio file
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
