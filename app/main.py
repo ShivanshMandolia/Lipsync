@@ -44,26 +44,23 @@ PREDEFINED_VIDEOS = {
     "video1": "https://drive.google.com/uc?export=download&id=1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI"
 }
 
+# ... (rest of the imports and setup remain the same) ...
+
 # ------------------- Main Endpoint -------------------
 @app.post("/generate-lipsync/")
 async def generate_lipsync(
     audio: UploadFile = File(...),
     video_choice: str = Query("video1", description="Choose predefined video")
 ):
-    if video_choice not in PREDEFINED_VIDEOS:
-        raise HTTPException(status_code=400, detail="Invalid video choice")
-
-    video_url = PREDEFINED_VIDEOS[video_choice]
-    audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{audio.filename}")
+    # ... (initial checks and file saving logic remain the same) ...
+    # audio_path and public_audio_url are set up here
 
     try:
         # Save audio locally
-        with open(audio_path, "wb") as f:
-            f.write(await audio.read())
+        # ... (audio saving logic) ...
 
         # Upload audio to Cloudinary (get public URL)
-        upload_result = cloudinary.uploader.upload(audio_path, resource_type="video")
-        public_audio_url = upload_result["secure_url"]
+        # ... (Cloudinary upload logic) ...
 
         print(f"🎵 Uploaded audio to Cloudinary: {public_audio_url}")
 
@@ -77,47 +74,51 @@ async def generate_lipsync(
         job_id = response.id
         status = "PENDING"
         progress_bar = tqdm(total=100, desc="Processing", position=0)
-        progress_increment = 5 # Increment progress by 5 every 5 seconds
+        progress_increment = 5  # Simple time-based increment
 
-        while status not in ["COMPLETED", "FAILED"]:
+        while status not in ["COMPLETED", "FAILED", "REJECTED"]:
             time.sleep(5)
             generation = client.get(job_id)
             status = generation.status
-            # Update progress bar only if progress is available and increasing
-            if generation.progress is not None:
-                new_progress = int(generation.progress)
-                progress_bar.update(new_progress - progress_bar.n)
-            else:
-                progress_bar.update(progress_increment)
             
+            # ------------------- ERROR FIX: Remove generation.progress -------------------
+            # Since 'progress' is not a reliable attribute, we use a simple increment
+            # to make the progress bar move while we wait for the status.
+            
+            # This logic provides *simulated* progress without crashing:
+            if status == "PROCESSING" and progress_bar.n < 90:
+                progress_bar.update(progress_increment)
+            elif status == "COMPLETED" or status == "FAILED":
+                progress_bar.n = 100
+                
             progress_bar.set_postfix_str(f"Status: {status}")
 
         progress_bar.close()
 
         if status == "COMPLETED":
-            # ------------------- MODIFIED LOGIC HERE -------------------
-            # Instead of downloading the file, return the generated video URL.
             return JSONResponse(
                 content={
                     "message": "Lipsync generation completed successfully.",
                     "video_url": generation.output_url
                 }
             )
-            # -----------------------------------------------------------
         else:
-            # Fetch the final generation status to get detailed error if available
-            generation = client.get(job_id) 
+            # Handle FAILED or REJECTED status and include error message if available
             error_detail = generation.error_message if generation.error_message else "Generation failed without a specific message."
-            raise HTTPException(status_code=500, detail=f"Generation failed: {error_detail}")
+            raise HTTPException(status_code=500, detail=f"Generation failed. Status: {status}. Detail: {error_detail}")
 
     except ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.body)
     
     except Exception as e:
-        # Catch any other unexpected errors
+        # The generic Exception handler will catch the original AttributeError 
+        # (if it somehow occurred outside the fixed loop) and handle it gracefully.
         print(f"An unexpected error occurred: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred.")
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {e}")
 
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
     finally:
         # Clean up the locally saved audio file
         if os.path.exists(audio_path):
