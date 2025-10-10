@@ -7,3 +7,4 @@ syncsdk    # if sync.so SDK is pip installable
 python-multipart
 cloudinary
 
+
