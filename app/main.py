@@ -1,126 +1,102 @@
-import os
-import uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from starlette.status import HTTP_202_ACCEPTED # ✅ IMPORT ADDED
-from fastapi.middleware.cors import CORSMiddleware
-import cloudinary
-import cloudinary.uploader
-from dotenv import load_dotenv
+from fastapi.responses import FileResponse
 from sync import Sync
 from sync.common import Audio, Video, GenerationOptions
 from sync.core.api_error import ApiError
+import os, uuid, time, requests, cloudinary, cloudinary.uploader
+from tqdm import tqdm
+from dotenv import load_dotenv
 
-# ------------------- Load Environment & Configuration -------------------
+# ------------------- Load Environment -------------------
 load_dotenv()
-app = FastAPI(title="Lip-Sync Generation API")
 
-# --- Environment Variables ---
-SYNC_API_KEY = os.getenv("SYNC_API_KEY")
+app = FastAPI(title="Sync.so Lip-Sync API")
+
+# Sync API Key
+API_KEY = os.getenv("SYNC_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Missing SYNC_API_KEY in environment variables")
+
+# Initialize Sync client
+client = Sync(base_url="https://api.sync.so", api_key=API_KEY).generations
+
+# Cloudinary Setup
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
-if not SYNC_API_KEY or not CLOUDINARY_URL:
-    raise RuntimeError("Missing SYNC_API_KEY or CLOUDINARY_URL in environment variables")
+if not CLOUDINARY_URL:
+    raise RuntimeError("Missing CLOUDINARY_URL in environment variables")
 
-# --- CORS Middleware (ALLOWS FRONTEND TO CONNECT) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Initialize API Clients & Constants ---
-client = Sync(base_url="https://api.sync.so", api_key=SYNC_API_KEY).generations
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
+
+# Local folder (for temp save)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Predefined videos
 PREDEFINED_VIDEOS = {
-    "video1": "https://res.cloudinary.com/dazwg6em3/video/upload/v1727710328/morgan_freeman_hbhs1g.mp4" # A reliable, directly hosted video
+    "video1": "https://drive.google.com/uc?export=download&id=1zEQnsgkUrFHGZDRzFPmxYXm0qKNREDFI"
 }
 
-# ------------------- 🚀 Step 1: Start Generation Endpoint -------------------
-
-@app.post("/generate", status_code=HTTP_202_ACCEPTED) # ✅ RENAMED and status code changed
-async def start_generation(
+# ------------------- Main Endpoint -------------------
+@app.post("/generate-lipsync/")
+async def generate_lipsync(
     audio: UploadFile = File(...),
-    video_choice: str = Query("video1", description="Choose a predefined video")):
-    """
-    Starts the lip-sync generation job and immediately returns a job_id.
-    This avoids the Gateway Timeout error by not waiting for the long-running task.
-    """
+    video_choice: str = Query("video1", description="Choose predefined video")
+):
     if video_choice not in PREDEFINED_VIDEOS:
-        raise HTTPException(status_code=400, detail="Invalid video choice.")
+        raise HTTPException(status_code=400, detail="Invalid video choice")
 
-    # Use a secure, unique filename for the temporary audio file
-    temp_audio_filename = f"{uuid.uuid4().hex}.wav"
-    audio_path = os.path.join(UPLOAD_FOLDER, temp_audio_filename)
+    video_url = PREDEFINED_VIDEOS[video_choice]
+    audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{audio.filename}")
 
     try:
-        # 1. Save and upload audio to Cloudinary (this part is fast)
+        # Save audio locally
         with open(audio_path, "wb") as f:
-            content = await audio.read()
-            f.write(content)
-        
+            f.write(await audio.read())
+
+        # Upload audio to Cloudinary (get public URL)
         upload_result = cloudinary.uploader.upload(audio_path, resource_type="video")
         public_audio_url = upload_result["secure_url"]
 
-        # 2. 🚀 Start the lip-sync job (DO NOT WAIT)
-        video_url = PREDEFINED_VIDEOS[video_choice]
+        print(f"🎵 Uploaded audio to Cloudinary: {public_audio_url}")
+
+        # Start Sync.so generation
         response = client.create(
             input=[Video(url=video_url), Audio(url=public_audio_url)],
             model="lipsync-2",
             options=GenerationOptions(sync_mode="cut_off")
         )
-        
-        # 3. ✅ Immediately return the job ID to the client
-        return {"job_id": response.id}
+
+        job_id = response.id
+        status = "PENDING"
+        progress_bar = tqdm(total=100, desc="Processing", position=0)
+
+        while status not in ["COMPLETED", "FAILED"]:
+            time.sleep(5)
+            generation = client.get(job_id)
+            status = generation.status
+            progress_bar.update(5)
+            progress_bar.set_postfix_str(f"Status: {status}")
+
+        progress_bar.close()
+
+        if status == "COMPLETED":
+            output_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_lipsync.mp4")
+            r = requests.get(generation.output_url, stream=True)
+            with open(output_file, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            return FileResponse(
+                path=output_file,
+                filename="lipsync_video.mp4",
+                media_type="video/mp4"
+            )
+        else:
+            raise HTTPException(status_code=500, detail="Generation failed")
 
     except ApiError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e.body))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+        raise HTTPException(status_code=e.status_code, detail=e.body)
+
     finally:
-        # 4. Clean up the local audio file
         if os.path.exists(audio_path):
             os.remove(audio_path)
-
-# ------------------- 🔄 Step 2: Status Check Endpoint -------------------
-
-@app.get("/status/{job_id}")
-async def get_status(job_id: str):
-    """
-    Checks the status of a long-running generation job using its job_id.
-    This is what the client will "poll" every few seconds.
-    """
-    try:
-        # 1. Get the latest status from the Sync.so API
-        generation = client.get(job_id)
-
-        # 2. If completed, upload the result to Cloudinary and return the final URL
-        if generation.status == "COMPLETED":
-            final_video_url = generation.output_url
-            # We upload to our own Cloudinary to have a permanent link
-            video_upload = cloudinary.uploader.upload(final_video_url, resource_type="video")
-            return {
-                "status": generation.status,
-                "video_url": video_upload["secure_url"]
-            }
-        
-        # 3. If failed, return the error
-        if generation.status == "FAILED":
-            return {
-                "status": generation.status,
-                "error": generation.error or "Lip-sync generation failed."
-            }
-
-        # 4. If still processing, just return the current status
-        return {"status": generation.status} # e.g., "PROCESSING"
-
-    except ApiError as e:
-        # This can happen if the job_id is invalid
-        if e.status_code == 404:
-            raise HTTPException(status_code=404, detail="Job ID not found.")
-        raise HTTPException(status_code=e.status_code, detail=str(e.body))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
