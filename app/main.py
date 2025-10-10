@@ -1,17 +1,25 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse # <-- Changed to return JSON
 from sync import Sync
 from sync.common import Audio, Video, GenerationOptions
 from sync.core.api_error import ApiError
 import os, uuid, time, requests, cloudinary, cloudinary.uploader
 from tqdm import tqdm
 from dotenv import load_dotenv
-
+from starlette.status import HTTP_202_ACCEPTED # ✅ IMPORT ADDED
+from fastapi.middleware.cors import CORSMiddleware
 # ------------------- Load Environment -------------------
 load_dotenv()
 
 app = FastAPI(title="Sync.so Lip-Sync API")
-
+# --- CORS Middleware (ALLOWS FRONTEND TO CONNECT) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Sync API Key
 API_KEY = os.getenv("SYNC_API_KEY")
 if not API_KEY:
@@ -69,34 +77,48 @@ async def generate_lipsync(
         job_id = response.id
         status = "PENDING"
         progress_bar = tqdm(total=100, desc="Processing", position=0)
+        progress_increment = 5 # Increment progress by 5 every 5 seconds
 
         while status not in ["COMPLETED", "FAILED"]:
             time.sleep(5)
             generation = client.get(job_id)
             status = generation.status
-            progress_bar.update(5)
+            # Update progress bar only if progress is available and increasing
+            if generation.progress is not None:
+                new_progress = int(generation.progress)
+                progress_bar.update(new_progress - progress_bar.n)
+            else:
+                progress_bar.update(progress_increment)
+            
             progress_bar.set_postfix_str(f"Status: {status}")
 
         progress_bar.close()
 
         if status == "COMPLETED":
-            output_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_lipsync.mp4")
-            r = requests.get(generation.output_url, stream=True)
-            with open(output_file, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            return FileResponse(
-                path=output_file,
-                filename="lipsync_video.mp4",
-                media_type="video/mp4"
+            # ------------------- MODIFIED LOGIC HERE -------------------
+            # Instead of downloading the file, return the generated video URL.
+            return JSONResponse(
+                content={
+                    "message": "Lipsync generation completed successfully.",
+                    "video_url": generation.output_url
+                }
             )
+            # -----------------------------------------------------------
         else:
-            raise HTTPException(status_code=500, detail="Generation failed")
+            # Fetch the final generation status to get detailed error if available
+            generation = client.get(job_id) 
+            error_detail = generation.error_message if generation.error_message else "Generation failed without a specific message."
+            raise HTTPException(status_code=500, detail=f"Generation failed: {error_detail}")
 
     except ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.body)
+    
+    except Exception as e:
+        # Catch any other unexpected errors
+        print(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred.")
 
     finally:
+        # Clean up the locally saved audio file
         if os.path.exists(audio_path):
             os.remove(audio_path)
